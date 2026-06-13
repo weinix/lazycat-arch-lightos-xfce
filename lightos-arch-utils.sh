@@ -270,21 +270,70 @@ export DESKTOP_LANG="\${DESKTOP_LANG:-${DESKTOP_LANG}}"
 command -v vncserver >/dev/null 2>&1 || { echo "vncserver not found (pacman -S tigervnc)" >&2; exit 1; }
 [ -x "\$WEBSOCKIFY" ] || { echo "websockify not found at \$WEBSOCKIFY" >&2; exit 1; }
 
-cleanup() { vncserver -kill ":\$DISPLAY_NUM" >/dev/null 2>&1 || true; }
+# LightOS injects XAUTHORITY=/run/catlink/.Xauthority, which cannot be locked;
+# force a user-writable X authority file or the X session can't authorize.
+export XAUTHORITY="\$HOME/.Xauthority"
+
+# xfce4-session needs XDG_RUNTIME_DIR to launch its components (wm/panel/...).
+# Prefer the logind runtime dir; fall back to a private dir we can always create.
+XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}"
+[ -d "\$XDG_RUNTIME_DIR" ] || XDG_RUNTIME_DIR="/tmp/runtime-\$(id -un)"
+mkdir -p "\$XDG_RUNTIME_DIR"; chmod 700 "\$XDG_RUNTIME_DIR"
+export XDG_RUNTIME_DIR
+
+# The new vncserver runs startxfce4 directly (it ignores the old xstartup, which
+# used dbus-run-session), so xfce4-session has no session bus and can't launch
+# its components. Start a real D-Bus session bus here and export it.
+if [ -z "\${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-launch >/dev/null 2>&1; then
+  eval "\$(dbus-launch --sh-syntax)"
+  export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
+fi
+
+# TigerVNC >=1.13 ignores CLI geometry/security flags: it reads them from the
+# per-user config and picks the desktop from /usr/share/xsessions/*.desktop.
+mkdir -p "\$HOME/.vnc"
+{
+  echo "session=xfce"
+  echo "geometry=\$GEOMETRY"
+  echo "depth=\$DEPTH"
+  echo "localhost"
+  echo "SecurityTypes=None"
+} > "\$HOME/.vnc/config"
+chmod 600 "\$HOME/.vnc/config"
+
+# Tear down any stale server on this display (new vncserver has no -kill).
+stale_pid="\$(pgrep -f "xinit .* /usr/bin/Xvnc :\$DISPLAY_NUM" 2>/dev/null | head -1)"
+[ -n "\$stale_pid" ] && kill "\$stale_pid" 2>/dev/null || true
+rm -f "/tmp/.X\$DISPLAY_NUM-lock" "/tmp/.X11-unix/X\$DISPLAY_NUM" 2>/dev/null || true
+
+cleanup() {
+  [ -n "\${VNC_PID:-}" ] && kill "\$VNC_PID" 2>/dev/null || true
+  [ -n "\${DBUS_SESSION_BUS_PID:-}" ] && kill "\$DBUS_SESSION_BUS_PID" 2>/dev/null || true
+  rm -f "/tmp/.X\$DISPLAY_NUM-lock" "/tmp/.X11-unix/X\$DISPLAY_NUM" 2>/dev/null || true
+}
 trap cleanup EXIT INT TERM HUP
 
-# Restart cleanly if a stale server is on this display.
-vncserver -kill ":\$DISPLAY_NUM" >/dev/null 2>&1 || true
-
 # No VNC password: access is gated by LightOS service forwarding to localhost.
-vncserver ":\$DISPLAY_NUM" -geometry "\$GEOMETRY" -depth "\$DEPTH" \\
-  -localhost yes -SecurityTypes None
+# New vncserver execs xinit in the FOREGROUND, so background it and wait for the
+# VNC port before launching websockify.
+vncserver ":\$DISPLAY_NUM" &
+VNC_PID=\$!
+
+i=0; up=0
+while [ \$i -lt 30 ]; do
+  if ss -ltn 2>/dev/null | grep -q "127.0.0.1:\$VNC_PORT"; then up=1; break; fi
+  kill -0 "\$VNC_PID" 2>/dev/null || break
+  i=\$((i + 1)); sleep 1
+done
+[ "\$up" = 1 ] || { echo "Xvnc did not come up on 127.0.0.1:\$VNC_PORT" >&2; exit 1; }
 
 echo "XFCE VNC on display :\$DISPLAY_NUM (127.0.0.1:\$VNC_PORT)"
 echo "Browser URL via service forwarding: http://127.0.0.1:\$NOVNC_PORT/"
 echo "WARNING: VNC auth is disabled; only expose port \$NOVNC_PORT over localhost/forwarding."
 
-exec "\$WEBSOCKIFY" --web="\$NOVNC_DIR" "0.0.0.0:\$NOVNC_PORT" "127.0.0.1:\$VNC_PORT"
+# websockify runs in the foreground as the service's main process; the EXIT trap
+# tears the VNC session down when it stops.
+"\$WEBSOCKIFY" --web="\$NOVNC_DIR" "0.0.0.0:\$NOVNC_PORT" "127.0.0.1:\$VNC_PORT"
 EOF
 )"
   write_owned_file "${user}" "${home}/bin/start-browser-desktop" 0755 "${content}"
@@ -313,8 +362,9 @@ Environment=DEPTH=${DEPTH}
 Environment=NOVNC_PORT=${NOVNC_PORT}
 Environment=NOVNC_DIR=${NOVNC_DIR}
 Environment=DESKTOP_LANG=${DESKTOP_LANG}
+Environment=XAUTHORITY=%h/.Xauthority
 ExecStart=${home}/bin/start-browser-desktop
-ExecStopPost=-/usr/bin/vncserver -kill :${VNC_DISPLAY_NUM}
+ExecStopPost=-/usr/bin/rm -f /tmp/.X${VNC_DISPLAY_NUM}-lock /tmp/.X11-unix/X${VNC_DISPLAY_NUM}
 Restart=on-failure
 RestartSec=2
 KillSignal=SIGTERM
@@ -330,8 +380,10 @@ EOF
 enable_desktop_service() {
   command -v systemctl >/dev/null 2>&1 || { warn "no systemctl; skipping service enable"; return 0; }
   run_sudo systemctl daemon-reload || { warn "daemon-reload failed (is systemd PID 1 in this container?)"; return 0; }
-  if run_sudo systemctl enable --now browser-desktop.service; then
-    log "browser-desktop.service enabled and started"
+  run_sudo systemctl enable browser-desktop.service >/dev/null 2>&1 || true
+  # restart (not just enable --now) so re-runs pick up unit/launcher changes.
+  if run_sudo systemctl restart browser-desktop.service; then
+    log "browser-desktop.service enabled and (re)started"
   else
     warn "service failed to start; inspect with: bash $0 status"
   fi

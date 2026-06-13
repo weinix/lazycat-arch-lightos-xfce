@@ -1,5 +1,7 @@
 # LightOS on Arch Linux — XFCE desktop setup
 
+*[中文文档 / Chinese README](lightos-arch-README.zh-CN.md)*
+
 The official LightOS guide ([lazycat.cloud/playground/guideline/1537](https://lazycat.cloud/playground/guideline/1537))
 only ships a **Debian** helper (`lightos-debian-utils.sh`). This is the **Arch Linux**
 equivalent for getting an XFCE desktop you can use from your browser.
@@ -37,8 +39,10 @@ What it installs/creates:
 - packages: `xfce4 xfce4-goodies tigervnc dbus xorg-xrdb xorg-xauth git python` + CJK fonts/locales
 - noVNC web assets in `/opt/novnc` (git clone, tag `v1.5.0`)
 - `websockify` in a venv at `/opt/novnc-venv`
-- `~/.vnc/xstartup` → `dbus-run-session -- startxfce4`
-- `~/bin/start-browser-desktop` launcher
+- `~/.vnc/config` → geometry/depth/`localhost`/`SecurityTypes=None` + `session=xfce`
+  (TigerVNC ≥ 1.13 reads options from here, **not** from CLI flags)
+- `~/bin/start-browser-desktop` launcher (starts a D-Bus session, the VNC server,
+  then websockify)
 - `browser-desktop.service` (systemd), enabled on boot
 
 ### Connecting
@@ -47,9 +51,9 @@ What it installs/creates:
    - address `127.0.0.1`, port `6080`
 2. Open the forwarded URL in your browser: `http://127.0.0.1:6080/`
 
-> VNC auth is **disabled** (`-SecurityTypes None`) and the server binds to
-> localhost only, exactly like the Debian default — access is gated by LightOS's
-> forwarding. Do **not** expose port 6080 publicly.
+> VNC auth is **disabled** (`SecurityTypes=None`) and the server binds to
+> localhost only (`localhost` in `~/.vnc/config`), exactly like the Debian default —
+> access is gated by LightOS's forwarding. Do **not** expose port 6080 publicly.
 
 ### Managing it
 
@@ -59,6 +63,28 @@ systemctl restart browser-desktop.service
 journalctl -u browser-desktop.service -f
 bash lightos-arch-utils.sh status      # works even if systemctl is unavailable
 ```
+
+### How it works on modern TigerVNC (≥ 1.13, e.g. Arch's 1.16)
+
+Arch ships a much newer `vncserver` than Debian, and its behaviour changed in ways
+that broke a naive `apt`→`pacman` port. The launcher accounts for all of these:
+
+- **Options come from a config file, not the CLI.** `vncserver` only accepts
+  `vncserver <display>`; `-geometry/-depth/-localhost/-SecurityTypes` are rejected.
+  → written to `~/.vnc/config` instead.
+- **The desktop session comes from `/usr/share/xsessions/*.desktop`,** not from
+  `~/.vnc/xstartup` (which is now ignored). `session=xfce` selects `xfce.desktop`
+  (`Exec=startxfce4`).
+- **`vncserver` runs `xinit` in the foreground** (it no longer daemonises), so the
+  launcher backgrounds it, waits for the VNC port, then runs websockify in front.
+- **`vncserver -kill` is gone;** teardown kills the process and removes the stale
+  `/tmp/.X<n>-lock` + socket.
+- **`XAUTHORITY` is forced to `~/.Xauthority`.** LightOS injects
+  `XAUTHORITY=/run/catlink/.Xauthority`, which can't be locked — leaving it set makes
+  the X session fail to authorize and the desktop never appears.
+- **A real D-Bus session bus + `XDG_RUNTIME_DIR` are set up** before launch (via
+  `dbus-launch`). Without them `xfce4-session` starts but launches none of its
+  components (you'd get a blank grey screen).
 
 ## Optional path: xrdp (LightOS-native RDP, port 3389)
 
@@ -105,6 +131,12 @@ bash lightos-arch-utils.sh --help
 ## Notes / caveats
 
 - Requires `systemd` running as PID 1 in the container (LightOS system containers
-  provide this) for the `--now` service enable to take effect.
+  provide this) for `systemctl enable`/`restart` to take effect.
 - TigerVNC's `vncserver` wrapper is provided by the official `tigervnc` package.
-- `dbus-run-session` comes from `dbus` on Arch (there is no `dbus-x11` package).
+  See *"How it works on modern TigerVNC"* above — its CLI/behaviour differs a lot
+  from Debian's older build.
+- `dbus-launch` comes from `dbus` on Arch (there is no `dbus-x11` package).
+- Benign log noise in a headless container: `libEGL … /dev/dri/card0 Permission
+  denied` (no GPU), `dbus-update-activation-environment … systemd1 exited` (no
+  `systemd --user`), `tumblerd` thumbnail-plugin and `xfce4-power-manager` messages.
+  None of these stop the desktop.
